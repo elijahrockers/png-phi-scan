@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "png-phi-scan"
+version = "0.1.0"
+description = "EasyOCR-based PHI detection for PNG and GIF images"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Elijah Rockers", email = "elijah.rockers@gmail.com"}]
+
+dependencies = [
+    "Pillow>=10.0.0",
+    "easyocr>=1.7",
+    "pydantic>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.3.0",
+]
+
+[project.scripts]
+png-phi-scan = "png_phi_scan.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["png_phi_scan"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
