@@ -118,7 +118,7 @@ class TestCollectFiles:
         assert remaining[0] != all_files[0]
 
     def test_empty_done_paths_returns_all(self, image_tree):
-        # Empty set is falsy, should take the non-resume path
+        # Empty set takes the done_paths branch (unsorted) but returns all files
         files_no_done = _collect_files(str(image_tree))
         files_empty_done = _collect_files(str(image_tree), done_paths=set())
         assert sorted(files_no_done) == sorted(files_empty_done)

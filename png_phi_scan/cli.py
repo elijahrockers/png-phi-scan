@@ -10,14 +10,13 @@ import sys
 import time
 from collections import defaultdict
 from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
-from .models import FileError, ScanReport
+from .models import FileError, PixelPHIFinding, ScanReport
 from .scanner import scan_file
 
 logger = logging.getLogger(__name__)
-
-IMAGE_EXTENSIONS = {".png", ".gif"}
 
 
 class ScanTimeout(Exception):
@@ -28,9 +27,17 @@ def _timeout_handler(signum, frame):
     raise ScanTimeout()
 
 
-def _is_image(path: Path) -> bool:
-    """Check if a path has a supported image extension."""
-    return path.suffix.lower() in IMAGE_EXTENSIONS
+@contextmanager
+def _file_timeout(seconds: int | None):
+    """Set and clear a SIGALRM-based per-file timeout."""
+    if seconds:
+        signal.signal(signal.SIGALRM, _timeout_handler)
+        signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        if seconds:
+            signal.alarm(0)
 
 
 def _is_image_ext(filename: str) -> bool:
@@ -54,13 +61,9 @@ def _walk_images(root: str, follow_symlinks: bool = False) -> Iterator[str]:
     with entries:
         for entry in entries:
             if entry.is_file(follow_symlinks=follow_symlinks):
-                if not follow_symlinks and entry.is_symlink():
-                    continue
                 if _is_image_ext(entry.name):
                     yield entry.path
             elif entry.is_dir(follow_symlinks=follow_symlinks):
-                if not follow_symlinks and entry.is_symlink():
-                    continue
                 yield from _walk_images(entry.path, follow_symlinks)
 
 
@@ -87,6 +90,9 @@ def _load_done_paths(output_file: str) -> set[str]:
     return done
 
 
+CHECKPOINT_INTERVAL = 500_000
+
+
 def _collect_files(
     directory: str,
     follow_symlinks: bool = False,
@@ -94,36 +100,28 @@ def _collect_files(
     done_paths: set[str] | None = None,
 ) -> list[str]:
     """Recursively collect image files from a directory using os.scandir()."""
-    if done_paths:
-        # Stream + filter — skip sort (order doesn't matter for resume)
-        files: list[str] = []
-        visited = 0
-        for p in _walk_images(directory, follow_symlinks):
-            visited += 1
-            if visited % 500_000 == 0:
-                print(f"[checkpoint]   ...visited {visited} image files")
+    files: list[str] = []
+    visited = 0
+    for p in _walk_images(directory, follow_symlinks):
+        visited += 1
+        if visited % CHECKPOINT_INTERVAL == 0:
+            print(f"[checkpoint]   ...visited {visited} image files")
+        if done_paths is not None:
             canonical = os.path.realpath(p) if follow_symlinks else p
-            if canonical not in done_paths:
-                files.append(p)
-                if limit is not None and len(files) >= limit:
-                    break
+            if canonical in done_paths:
+                continue
+        files.append(p)
+        if limit is not None and len(files) >= limit:
+            break
+    if done_paths is not None:
         print(
             f"[checkpoint]   ...visited {visited} total,"
             f" {len(files)} remaining after resume filter"
         )
         return files
-
     if limit is not None:
-        # Stream with early exit — don't materialize all paths
-        files = []
-        for p in _walk_images(directory, follow_symlinks):
-            files.append(p)
-            if len(files) >= limit:
-                break
         return files
-
-    # Full collection with sort for deterministic ordering (needed for chunks)
-    return sorted(_walk_images(directory, follow_symlinks))
+    return sorted(files)
 
 
 def _collect_manifest(
@@ -151,6 +149,16 @@ def _collect_manifest(
     return paths
 
 
+def _format_finding(f: PixelPHIFinding, n_frames: int, indent: str = "  ") -> str:
+    """Format a single finding as a human-readable string."""
+    frame_info = f" frame={f.frame_index}" if n_frames > 1 else ""
+    return (
+        f"{indent}[{f.severity.value.upper()}] \"{f.text}\""
+        f" at ({f.bbox.x},{f.bbox.y}) {f.bbox.width}x{f.bbox.height}"
+        f" conf={f.confidence:.0%}{frame_info}"
+    )
+
+
 def _print_file_findings(report: ScanReport, index: int, total: int, short_path: str) -> None:
     """Print condensed per-file findings during batch scan."""
     phi_count = report.total_phi_count
@@ -162,12 +170,7 @@ def _print_file_findings(report: ScanReport, index: int, total: int, short_path:
     if report.pixel_findings:
         print(f"  Pixel text ({len(report.pixel_findings)}):")
         for f in report.pixel_findings:
-            frame_info = f" frame={f.frame_index}" if report.n_frames > 1 else ""
-            print(
-                f"    [{f.severity.value.upper()}] \"{f.text}\""
-                f" at ({f.bbox.x},{f.bbox.y}) {f.bbox.width}x{f.bbox.height}"
-                f" conf={f.confidence:.0%}{frame_info}"
-            )
+            print(_format_finding(f, report.n_frames, indent="    "))
 
 
 def _print_summary(report: ScanReport) -> None:
@@ -187,12 +190,7 @@ def _print_summary(report: ScanReport) -> None:
     if report.pixel_findings:
         print(f"--- Pixel Findings ({len(report.pixel_findings)}) ---")
         for f in report.pixel_findings:
-            frame_info = f" [frame {f.frame_index}]" if report.n_frames > 1 else ""
-            print(
-                f"  [{f.severity.value.upper()}] \"{f.text}\""
-                f" at ({f.bbox.x},{f.bbox.y}) {f.bbox.width}x{f.bbox.height}"
-                f" conf={f.confidence:.0%}{frame_info}"
-            )
+            print(_format_finding(f, report.n_frames))
         print()
 
     if report.recommendations:
@@ -254,14 +252,8 @@ def _scan_single(
     max_frames: int = 50, batch_size: int = 16,
 ) -> int:
     """Scan a single file, print summary, write JSON report."""
-    if timeout:
-        signal.signal(signal.SIGALRM, _timeout_handler)
-        signal.alarm(timeout)
-    try:
+    with _file_timeout(timeout):
         report = scan_file(filepath, max_frames=max_frames, batch_size=batch_size)
-    finally:
-        if timeout:
-            signal.alarm(0)
 
     _print_summary(report)
 
@@ -311,18 +303,13 @@ def _scan_batch(
             short_path = f"{parent_name}/{os.path.basename(filepath)}"
 
             try:
-                if timeout:
-                    signal.signal(signal.SIGALRM, _timeout_handler)
-                    signal.alarm(timeout)
-                try:
-                    report = scan_file(
-                        filepath, max_frames=max_frames, batch_size=batch_size,
-                    )
-                except ScanTimeout:
-                    raise ScanTimeout(f"Timed out after {timeout}s")
-                finally:
-                    if timeout:
-                        signal.alarm(0)
+                with _file_timeout(timeout):
+                    try:
+                        report = scan_file(
+                            filepath, max_frames=max_frames, batch_size=batch_size,
+                        )
+                    except ScanTimeout:
+                        raise ScanTimeout(f"Timed out after {timeout}s")
             except Exception as exc:
                 files_errored += 1
                 error_list.append((filepath, str(exc)))
