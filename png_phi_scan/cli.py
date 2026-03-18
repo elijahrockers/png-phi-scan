@@ -59,6 +59,7 @@ def _collect_files(
     directory: Path,
     follow_symlinks: bool = False,
     limit: int | None = None,
+    done_paths: set[str] | None = None,
 ) -> list[Path]:
     """Recursively collect image files from a directory."""
     if limit is not None:
@@ -70,7 +71,26 @@ def _collect_files(
                 if len(files) >= limit:
                     break
         return files
-    # Full collection with sort for deterministic ordering (needed for --resume, chunks)
+
+    if done_paths:
+        # Stream + filter — skip sort (order doesn't matter for resume)
+        files = []
+        visited = 0
+        for p in directory.glob("**/*"):
+            if not (p.is_file() and _is_image(p) and (follow_symlinks or not p.is_symlink())):
+                continue
+            visited += 1
+            if visited % 500_000 == 0:
+                print(f"[checkpoint]   ...visited {visited} image files")
+            if os.path.realpath(str(p)) not in done_paths:
+                files.append(p)
+        print(
+            f"[checkpoint]   ...visited {visited} total,"
+            f" {len(files)} remaining after resume filter"
+        )
+        return files
+
+    # Full collection with sort for deterministic ordering (needed for chunks)
     return sorted(
         p for p in directory.glob("**/*")
         if p.is_file() and _is_image(p)
@@ -237,19 +257,10 @@ def _scan_batch(
     batch_size: int = 16,
 ) -> int:
     """Scan multiple files, print per-file findings and aggregate summary, write JSONL."""
-    if resume and output_file:
-        done_paths = _load_done_paths(output_file)
-        if done_paths:
-            original_count = len(files)
-            files = [f for f in files if os.path.realpath(str(f)) not in done_paths]
-            skipped = original_count - len(files)
-            total = len(files)
-            print(f"Resume: {skipped} files already in output, {total} remaining")
-            if total == 0:
-                print("Nothing left to scan.")
-                return 0
-
     total = len(files)
+    if total == 0:
+        print("Nothing left to scan.")
+        return 0
     print(f"\nScanning {total} files in {source} ...")
     if output_file:
         print(f"Writing JSONL report to {output_file}")
@@ -414,6 +425,17 @@ def main():
     t0 = time.monotonic()
     print(f"[checkpoint] Args parsed at +{time.monotonic() - t0:.1f}s")
 
+    # Load done_paths early so _collect_files can filter during streaming
+    done_paths: set[str] = set()
+    if args.resume and args.output_file:
+        print("[checkpoint] Loading completed paths from output...")
+        t_done = time.monotonic()
+        done_paths = _load_done_paths(args.output_file)
+        print(
+            f"[checkpoint] Loaded {len(done_paths)} completed paths"
+            f" in {time.monotonic() - t_done:.1f}s"
+        )
+
     # Collect files first (before heavy OCR init)
     files = None
     source = None
@@ -423,7 +445,7 @@ def main():
             parser.error(f"Not a directory: {args.directory}")
         print(f"[checkpoint] Collecting files from {args.directory}...")
         t_collect = time.monotonic()
-        files = _collect_files(dirpath, args.follow_symlinks, args.limit)
+        files = _collect_files(dirpath, args.follow_symlinks, args.limit, done_paths=done_paths)
         print(
             f"[checkpoint] Collected {len(files)} files in"
             f" {time.monotonic() - t_collect:.1f}s"
