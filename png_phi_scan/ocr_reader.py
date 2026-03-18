@@ -4,16 +4,17 @@ Avoids reloading the ~100MB model per call. Mirrors the pattern from
 dicom-phi-scan/src/pixel_scanner.py.
 """
 
-import logging
+from __future__ import annotations
 
-import easyocr
+import logging
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 MIN_OCR_CONFIDENCE = 0.30
 
 # Lazy singleton state
-_reader: easyocr.Reader | None = None
+_reader: Any = None  # easyocr.Reader, created lazily
 _use_gpu: bool | None = None
 
 
@@ -23,6 +24,8 @@ def init_reader(gpu: bool | None = None) -> None:
     Args:
         gpu: True to force GPU, False to force CPU, None to auto-detect via CUDA.
     """
+    import easyocr  # deferred — heavy (loads torch)
+
     global _reader, _use_gpu
     if gpu is None:
         import torch
@@ -34,7 +37,7 @@ def init_reader(gpu: bool | None = None) -> None:
     _reader = easyocr.Reader(["en"], gpu=_use_gpu)
 
 
-def get_reader() -> easyocr.Reader:
+def get_reader() -> Any:
     """Return the shared EasyOCR Reader, creating it on first use."""
     global _reader
     if _reader is None:

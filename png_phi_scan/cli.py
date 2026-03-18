@@ -7,11 +7,11 @@ import logging
 import os
 import signal
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
 from .models import FileError, ScanReport
-from .ocr_reader import init_reader
 from .scanner import scan_file
 
 logger = logging.getLogger(__name__)
@@ -61,14 +61,21 @@ def _collect_files(
     limit: int | None = None,
 ) -> list[Path]:
     """Recursively collect image files from a directory."""
-    files = sorted(
+    if limit is not None:
+        # Stream with early exit — don't materialize all paths
+        files = []
+        for p in directory.glob("**/*"):
+            if p.is_file() and _is_image(p) and (follow_symlinks or not p.is_symlink()):
+                files.append(p)
+                if len(files) >= limit:
+                    break
+        return files
+    # Full collection with sort for deterministic ordering (needed for --resume, chunks)
+    return sorted(
         p for p in directory.glob("**/*")
         if p.is_file() and _is_image(p)
         and (follow_symlinks or not p.is_symlink())
     )
-    if limit is not None:
-        files = files[:limit]
-    return files
 
 
 def _collect_manifest(
@@ -404,8 +411,43 @@ def main():
         if args.filepath:
             parser.error("--resume is only supported in batch mode (--dir or --manifest)")
 
-    # Initialize OCR reader
+    t0 = time.monotonic()
+    print(f"[checkpoint] Args parsed at +{time.monotonic() - t0:.1f}s")
+
+    # Collect files first (before heavy OCR init)
+    files = None
+    source = None
+    if args.directory:
+        dirpath = Path(args.directory)
+        if not dirpath.is_dir():
+            parser.error(f"Not a directory: {args.directory}")
+        print(f"[checkpoint] Collecting files from {args.directory}...")
+        t_collect = time.monotonic()
+        files = _collect_files(dirpath, args.follow_symlinks, args.limit)
+        print(
+            f"[checkpoint] Collected {len(files)} files in"
+            f" {time.monotonic() - t_collect:.1f}s"
+        )
+        source = args.directory
+    elif args.manifest:
+        manifest_path = Path(args.manifest)
+        if not manifest_path.is_file():
+            parser.error(f"Manifest not found: {args.manifest}")
+        files = _collect_manifest(manifest_path, args.chunk_size, args.chunk_index, args.limit)
+        source = args.manifest
+
+    if files is not None and not files:
+        logger.warning("No image files found")
+        sys.exit(0)
+
+    # Initialize OCR reader (heavy — loads torch + easyocr)
+    from .ocr_reader import init_reader
+
+    print("[checkpoint] Initializing EasyOCR model...")
+    t_ocr = time.monotonic()
     init_reader(gpu=False if args.cpu else None)
+    device = "GPU" if not args.cpu else "CPU"
+    print(f"[checkpoint] EasyOCR ready ({device}) in {time.monotonic() - t_ocr:.1f}s")
 
     # Single file mode
     if args.filepath:
@@ -420,23 +462,6 @@ def main():
         sys.exit(exit_code)
 
     # Batch modes
-    if args.directory:
-        dirpath = Path(args.directory)
-        if not dirpath.is_dir():
-            parser.error(f"Not a directory: {args.directory}")
-        files = _collect_files(dirpath, args.follow_symlinks, args.limit)
-        source = args.directory
-    else:
-        manifest_path = Path(args.manifest)
-        if not manifest_path.is_file():
-            parser.error(f"Manifest not found: {args.manifest}")
-        files = _collect_manifest(manifest_path, args.chunk_size, args.chunk_index, args.limit)
-        source = args.manifest
-
-    if not files:
-        logger.warning("No image files found")
-        sys.exit(0)
-
     exit_code = _scan_batch(
         files, source, args.output_file, args.verbose,
         args.timeout, args.resume, args.max_frames, args.batch_size,

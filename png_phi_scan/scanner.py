@@ -5,6 +5,7 @@ For GIF files, iterates over animation frames up to a configurable cap.
 """
 
 import logging
+import time
 
 from PIL import Image, ImageSequence
 
@@ -25,6 +26,9 @@ def scan_file(filepath: str, max_frames: int = 50, batch_size: int = 16) -> Scan
     Returns:
         ScanReport with all findings and recommendations.
     """
+    t_start = time.monotonic()
+    logger.debug("scan_file: start %s", filepath)
+
     img = Image.open(filepath)
     width, height = img.size
     n_frames = getattr(img, "n_frames", 1)
@@ -41,6 +45,7 @@ def scan_file(filepath: str, max_frames: int = 50, batch_size: int = 16) -> Scan
             pixel_findings.extend(scan_image(frame, i, batch_size=batch_size))
 
     img.close()
+    logger.debug("scan_file: done %s in %.2fs", filepath, time.monotonic() - t_start)
 
     total = len(pixel_findings)
 
