@@ -9,6 +9,7 @@ import signal
 import sys
 import time
 from collections import defaultdict
+from collections.abc import Iterator
 from pathlib import Path
 
 from .models import FileError, ScanReport
@@ -32,8 +33,39 @@ def _is_image(path: Path) -> bool:
     return path.suffix.lower() in IMAGE_EXTENSIONS
 
 
+def _is_image_ext(filename: str) -> bool:
+    """Check if a filename has a supported image extension (string-based, no Path)."""
+    lower = filename.lower()
+    return lower.endswith(".png") or lower.endswith(".gif")
+
+
+def _walk_images(root: str, follow_symlinks: bool = False) -> Iterator[str]:
+    """Recursively yield image file paths using os.scandir().
+
+    On Linux, DirEntry.is_file() and is_symlink() read from the d_type field
+    in the getdents() buffer — zero extra syscalls. This is critical for NFS
+    directories with millions of files.
+    """
+    try:
+        entries = os.scandir(root)
+    except PermissionError:
+        logger.warning("Permission denied: %s", root)
+        return
+    with entries:
+        for entry in entries:
+            if entry.is_file(follow_symlinks=follow_symlinks):
+                if not follow_symlinks and entry.is_symlink():
+                    continue
+                if _is_image_ext(entry.name):
+                    yield entry.path
+            elif entry.is_dir(follow_symlinks=follow_symlinks):
+                if not follow_symlinks and entry.is_symlink():
+                    continue
+                yield from _walk_images(entry.path, follow_symlinks)
+
+
 def _load_done_paths(output_file: str) -> set[str]:
-    """Read an existing JSONL output and return resolved paths already scanned."""
+    """Read an existing JSONL output and return paths already scanned."""
     done: set[str] = set()
     path = Path(output_file)
     if not path.exists():
@@ -47,7 +79,7 @@ def _load_done_paths(output_file: str) -> set[str]:
                 record = json.loads(line)
                 raw_path = record.get("filepath", "")
                 if raw_path:
-                    done.add(os.path.realpath(raw_path))
+                    done.add(raw_path)
             except json.JSONDecodeError:
                 logger.warning(
                     "Skipping corrupted line %d in %s", line_no, output_file,
@@ -56,46 +88,42 @@ def _load_done_paths(output_file: str) -> set[str]:
 
 
 def _collect_files(
-    directory: Path,
+    directory: str,
     follow_symlinks: bool = False,
     limit: int | None = None,
     done_paths: set[str] | None = None,
-) -> list[Path]:
-    """Recursively collect image files from a directory."""
-    if limit is not None:
-        # Stream with early exit — don't materialize all paths
-        files = []
-        for p in directory.glob("**/*"):
-            if p.is_file() and _is_image(p) and (follow_symlinks or not p.is_symlink()):
-                files.append(p)
-                if len(files) >= limit:
-                    break
-        return files
-
+) -> list[str]:
+    """Recursively collect image files from a directory using os.scandir()."""
     if done_paths:
         # Stream + filter — skip sort (order doesn't matter for resume)
-        files = []
+        files: list[str] = []
         visited = 0
-        for p in directory.glob("**/*"):
-            if not (p.is_file() and _is_image(p) and (follow_symlinks or not p.is_symlink())):
-                continue
+        for p in _walk_images(directory, follow_symlinks):
             visited += 1
             if visited % 500_000 == 0:
                 print(f"[checkpoint]   ...visited {visited} image files")
-            if os.path.realpath(str(p)) not in done_paths:
+            canonical = os.path.realpath(p) if follow_symlinks else p
+            if canonical not in done_paths:
                 files.append(p)
+                if limit is not None and len(files) >= limit:
+                    break
         print(
             f"[checkpoint]   ...visited {visited} total,"
             f" {len(files)} remaining after resume filter"
         )
         return files
 
+    if limit is not None:
+        # Stream with early exit — don't materialize all paths
+        files = []
+        for p in _walk_images(directory, follow_symlinks):
+            files.append(p)
+            if len(files) >= limit:
+                break
+        return files
+
     # Full collection with sort for deterministic ordering (needed for chunks)
-    return sorted(
-        p for p in directory.glob("**/*")
-        if p.is_file() and _is_image(p)
-        and (follow_symlinks or not p.is_symlink())
-    )
+    return sorted(_walk_images(directory, follow_symlinks))
 
 
 def _collect_manifest(
@@ -252,7 +280,7 @@ FLUSH_INTERVAL = 100
 
 
 def _scan_batch(
-    files: list[Path], source: str, output_file: str | None, verbose: bool,
+    files: list[str], source: str, output_file: str | None, verbose: bool,
     timeout: int | None = None, resume: bool = False, max_frames: int = 50,
     batch_size: int = 16,
 ) -> int:
@@ -279,7 +307,8 @@ def _scan_batch(
     out = open(output_file, mode) if output_file else None  # noqa: SIM115
     try:
         for i, filepath in enumerate(files, 1):
-            short_path = f"{filepath.parent.name}/{filepath.name}"
+            parent_name = os.path.basename(os.path.dirname(filepath))
+            short_path = f"{parent_name}/{os.path.basename(filepath)}"
 
             try:
                 if timeout:
@@ -287,7 +316,7 @@ def _scan_batch(
                     signal.alarm(timeout)
                 try:
                     report = scan_file(
-                        str(filepath), max_frames=max_frames, batch_size=batch_size,
+                        filepath, max_frames=max_frames, batch_size=batch_size,
                     )
                 except ScanTimeout:
                     raise ScanTimeout(f"Timed out after {timeout}s")
@@ -296,10 +325,10 @@ def _scan_batch(
                         signal.alarm(0)
             except Exception as exc:
                 files_errored += 1
-                error_list.append((str(filepath), str(exc)))
+                error_list.append((filepath, str(exc)))
                 print(f"\n[{i}/{total}] {short_path} -- ERROR: {exc}")
                 if out:
-                    error = FileError(filepath=str(filepath), error=str(exc))
+                    error = FileError(filepath=filepath, error=str(exc))
                     out.write(error.model_dump_json() + "\n")
                     out.flush()
                 if i % GC_INTERVAL == 0:
@@ -443,9 +472,13 @@ def main():
         dirpath = Path(args.directory)
         if not dirpath.is_dir():
             parser.error(f"Not a directory: {args.directory}")
-        print(f"[checkpoint] Collecting files from {args.directory}...")
+        # Resolve once so all walked paths start from the canonical root
+        canonical_dir = os.path.realpath(args.directory)
+        print(f"[checkpoint] Collecting files from {canonical_dir}...")
         t_collect = time.monotonic()
-        files = _collect_files(dirpath, args.follow_symlinks, args.limit, done_paths=done_paths)
+        files = _collect_files(
+            canonical_dir, args.follow_symlinks, args.limit, done_paths=done_paths,
+        )
         print(
             f"[checkpoint] Collected {len(files)} files in"
             f" {time.monotonic() - t_collect:.1f}s"
@@ -455,7 +488,10 @@ def main():
         manifest_path = Path(args.manifest)
         if not manifest_path.is_file():
             parser.error(f"Manifest not found: {args.manifest}")
-        files = _collect_manifest(manifest_path, args.chunk_size, args.chunk_index, args.limit)
+        manifest_paths = _collect_manifest(
+            manifest_path, args.chunk_size, args.chunk_index, args.limit,
+        )
+        files = [os.path.realpath(str(p)) for p in manifest_paths]
         source = args.manifest
 
     if files is not None and not files:
