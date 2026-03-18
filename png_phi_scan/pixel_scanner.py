@@ -11,21 +11,31 @@ from .models import BoundingBox, PixelPHIFinding, Severity
 from .ocr_reader import MIN_OCR_CONFIDENCE, get_reader
 
 
-def scan_image(image: Image.Image, frame_index: int = 0) -> list[PixelPHIFinding]:
+def scan_image(
+    image: Image.Image, frame_index: int = 0, batch_size: int = 16,
+) -> list[PixelPHIFinding]:
     """Run OCR on a single image/frame and return PHI findings.
 
     Args:
         image: PIL Image to scan.
         frame_index: Frame index (0 for PNG, 0..N for GIF).
+        batch_size: EasyOCR recognition batch size (higher = faster on GPU).
 
     Returns:
         List of PixelPHIFinding for detected text.
     """
-    rgb = image.convert("RGB")
-    img_array = np.array(rgb)
+    if image.mode == "RGB":
+        img_array = np.array(image)
+    else:
+        img_array = np.array(image.convert("RGB"))
 
     reader = get_reader()
-    ocr_results = reader.readtext(img_array)
+    ocr_results = reader.readtext(
+        img_array,
+        batch_size=batch_size,
+        decoder="greedy",
+        paragraph=False,
+    )
 
     findings: list[PixelPHIFinding] = []
     for bbox_pts, text, conf in ocr_results:

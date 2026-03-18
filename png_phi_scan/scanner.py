@@ -4,7 +4,6 @@ Pixel-only scan: runs OCR on image frames to detect burned-in text.
 For GIF files, iterates over animation frames up to a configurable cap.
 """
 
-import gc
 import logging
 
 from PIL import Image, ImageSequence
@@ -15,12 +14,13 @@ from .pixel_scanner import scan_image
 logger = logging.getLogger(__name__)
 
 
-def scan_file(filepath: str, max_frames: int = 50) -> ScanReport:
+def scan_file(filepath: str, max_frames: int = 50, batch_size: int = 16) -> ScanReport:
     """Scan a PNG or GIF file for PHI in pixel data.
 
     Args:
         filepath: Path to .png or .gif file.
         max_frames: Maximum number of GIF frames to scan.
+        batch_size: EasyOCR recognition batch size (higher = faster on GPU).
 
     Returns:
         ScanReport with all findings and recommendations.
@@ -32,17 +32,15 @@ def scan_file(filepath: str, max_frames: int = 50) -> ScanReport:
     pixel_findings = []
 
     if n_frames == 1:
-        pixel_findings.extend(scan_image(img, 0))
+        pixel_findings.extend(scan_image(img, 0, batch_size=batch_size))
     else:
         frames_to_scan = min(n_frames, max_frames)
         for i, frame in enumerate(ImageSequence.Iterator(img)):
             if i >= frames_to_scan:
                 break
-            pixel_findings.extend(scan_image(frame, i))
+            pixel_findings.extend(scan_image(frame, i, batch_size=batch_size))
 
     img.close()
-    del img
-    gc.collect()
 
     total = len(pixel_findings)
 

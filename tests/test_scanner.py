@@ -62,3 +62,10 @@ def test_gif_max_frames_cap():
     # All findings should be from frame 0 only
     for f in report.pixel_findings:
         assert f.frame_index == 0
+
+
+def test_batch_size_passthrough():
+    """batch_size parameter threads through to scan_image without error."""
+    report = scan_file(_fixture("test_phi_text.png"), batch_size=4)
+    assert report.total_phi_count > 0
+    assert report.has_phi is True

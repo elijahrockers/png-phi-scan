@@ -196,14 +196,14 @@ def _print_batch_summary(
 
 def _scan_single(
     filepath: str, output_file: str | None, timeout: int | None = None,
-    max_frames: int = 50,
+    max_frames: int = 50, batch_size: int = 16,
 ) -> int:
     """Scan a single file, print summary, write JSON report."""
     if timeout:
         signal.signal(signal.SIGALRM, _timeout_handler)
         signal.alarm(timeout)
     try:
-        report = scan_file(filepath, max_frames=max_frames)
+        report = scan_file(filepath, max_frames=max_frames, batch_size=batch_size)
     finally:
         if timeout:
             signal.alarm(0)
@@ -220,9 +220,14 @@ def _scan_single(
     return 1 if report.has_phi else 0
 
 
+GC_INTERVAL = 500
+FLUSH_INTERVAL = 100
+
+
 def _scan_batch(
     files: list[Path], source: str, output_file: str | None, verbose: bool,
     timeout: int | None = None, resume: bool = False, max_frames: int = 50,
+    batch_size: int = 16,
 ) -> int:
     """Scan multiple files, print per-file findings and aggregate summary, write JSONL."""
     if resume and output_file:
@@ -263,7 +268,9 @@ def _scan_batch(
                     signal.signal(signal.SIGALRM, _timeout_handler)
                     signal.alarm(timeout)
                 try:
-                    report = scan_file(str(filepath), max_frames=max_frames)
+                    report = scan_file(
+                        str(filepath), max_frames=max_frames, batch_size=batch_size,
+                    )
                 except ScanTimeout:
                     raise ScanTimeout(f"Timed out after {timeout}s")
                 finally:
@@ -277,16 +284,18 @@ def _scan_batch(
                     error = FileError(filepath=str(filepath), error=str(exc))
                     out.write(error.model_dump_json() + "\n")
                     out.flush()
-                gc.collect()
+                if i % GC_INTERVAL == 0:
+                    gc.collect()
                 continue
 
             # Print per-file findings
             _print_file_findings(report, i, total, short_path)
 
-            # Stream to JSONL
+            # Stream to JSONL (buffered flush)
             if out:
                 out.write(report.model_dump_json() + "\n")
-                out.flush()
+                if i % FLUSH_INTERVAL == 0:
+                    out.flush()
 
             # Accumulate stats
             risk_counts[report.risk_level.value] += 1
@@ -299,8 +308,9 @@ def _scan_batch(
             for f in report.pixel_findings:
                 pixel_text_counts[f.text] += 1
 
-            del report
-            gc.collect()
+            # Periodic GC instead of per-file
+            if i % GC_INTERVAL == 0:
+                gc.collect()
     finally:
         if out:
             out.close()
@@ -366,6 +376,8 @@ def main():
                         help="Per-file timeout in seconds (default: no timeout)")
     parser.add_argument("--cpu", action="store_true",
                         help="Force CPU for OCR even if GPU is available")
+    parser.add_argument("--batch-size", type=int, default=16,
+                        help="EasyOCR recognition batch size (default: 16, higher = faster on GPU)")
     parser.add_argument("--resume", action="store_true",
                         help="Resume interrupted batch scan; skip files already in output JSONL")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -400,6 +412,7 @@ def main():
         try:
             exit_code = _scan_single(
                 args.filepath, args.output_file, args.timeout, args.max_frames,
+                args.batch_size,
             )
         except Exception as exc:
             logger.error("Failed to scan %s: %s", args.filepath, exc)
@@ -426,6 +439,6 @@ def main():
 
     exit_code = _scan_batch(
         files, source, args.output_file, args.verbose,
-        args.timeout, args.resume, args.max_frames,
+        args.timeout, args.resume, args.max_frames, args.batch_size,
     )
     sys.exit(exit_code)
